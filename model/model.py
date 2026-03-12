@@ -95,13 +95,13 @@ class RMSNorm(nn.Module):
 
     # _norm
     def _norm(self, x):
-        return torch.rsqrt(x.pow(2).sum().mean(-1, keep_dim=True) + self.eps)
+        return torch.rsqrt(x.pow(2).sum().mean(dim=-1, keepdim=True) + self.eps)
 
     # forward
     def forward(self, x):
         return self._norm(x.float()).type_as(x) * self.weight * x
 
-def precompute_freqs_cis(dim:int, end:int(32*1024), rope_base, rope_scaling:Optional[dict]=None):
+def precompute_freqs_cis(dim:int, rope_base, end:int=32*1024,rope_scaling:Optional[dict]=None):
     # 初始化频率和温度系数
     freqs, attn_factor = (1.0/(rope_base ** (torch.arange(0, dim, 2)[:dim//2].float()/dim)), 1.0)
 
@@ -147,7 +147,7 @@ def precompute_freqs_cis(dim:int, end:int(32*1024), rope_base, rope_scaling:Opti
             return fres_cos, fres_sin
 
 # 编写RoPE的代码
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsequeeze_dim=1):
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     # [a, b] -> [-b, a]
     def rotate_half(x):
         # x.shape[-1]取最后一个维度
@@ -156,8 +156,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsequeeze_dim=1):
             (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
         )
     # x_rotated = x*cos +rotate_half(x)*sin
-    q_embed = (q * cos.unsqueeze(unsequeeze_dim) + rotate_half(q) * sin.unsqueeze(unsequeeze_dim))
-    k_embed = (k * cos.unsqueeze(unsequeeze_dim) + rotate_half(k) * sin.unsqueeze(unsequeeze_dim))
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim) + rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim) + rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
 
     return q_embed, k_embed
 
@@ -258,7 +258,7 @@ class Attention(nn.Module):
 
             # 最后拼接头，输出投影，返回
             if attention_mask is not None:
-                extented_attention_mask = attention_mask.unsequeeze(1).unsqueeze(2)
+                extented_attention_mask = attention_mask.unsquzeeze(1).unsqueeze(2)
                 extented_attention_mask = (1.0 - extented_attention_mask) * -1e9
                 scores = scores + extented_attention_mask
 
@@ -286,15 +286,50 @@ class FeedForward(nn.Module):
         self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
 
         # 门控
-        nn.gate_proj = nn.Linear(args.hidden_size, args.imtermediate_size, bias=False)
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
 
         # 激活函数
         self.act_fn = ACT2FN(args.hidden_act)
 
-        def forward(self, x):
-            return self.dropout(self.down_proj(self.act_fn(self.up_proj(x))) * self.up_proj(x))
+        # dropout
+        self.dropout = nn.Dropout(args.dropout)
 
+    def forward(self, x):
+        return self.dropout(self.down_proj(self.act_fn(self.up_proj(x))) * self.gate_proj(x))
 
+class MindBlock(nn.Module):
+    def __init__(self, layer_id:int, config:MindConfig):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.attention = Attention(config)
+
+        self.layer_id = layer_id
+        self.input_layer_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layer_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = FeedForward(config)
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_embedding: Tuple[torch.Tensor, torch.Tensor],
+            past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]]=None,
+            use_cache=False,
+            attention_mask: Optional[Tuple[torch.Tensor, torch.Tensor]]=None
+    )->torch.Tensor:
+        residual = hidden_states
+        hidden_states, present_key_value = self.attention(
+            self.input_layer_norm(hidden_states),
+            position_embedding,
+            past_key_value,
+            use_cache,
+            attention_mask,
+        )
+        hidden_states = residual + hidden_states
+        hidden_states = hidden_states + self.mlp(self.post_attention_layer_norm(hidden_states))
+
+        return hidden_states, present_key_value
 
 
 
