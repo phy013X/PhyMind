@@ -272,6 +272,27 @@ class Attention(nn.Module):
 
         return output, past_key_value
 
+class FeedForward(nn.Module):
+    # 初始化
+    def __init__(self, args:MindConfig):
+        super().__init__()
+        # 升维
+        if args.intermediate_size is None:
+            intermediate_size = int(args.hidden_size * 8 / 3)
+            args.intermediate_size = 64*(intermediate_size + 64 - 1)//64
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+
+        # 降维
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+
+        # 门控
+        nn.gate_proj = nn.Linear(args.hidden_size, args.imtermediate_size, bias=False)
+
+        # 激活函数
+        self.act_fn = ACT2FN(args.hidden_act)
+
+        def forward(self, x):
+            return self.dropout(self.down_proj(self.act_fn(self.up_proj(x))) * self.up_proj(x))
 
 
 
