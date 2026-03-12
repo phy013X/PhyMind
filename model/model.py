@@ -402,6 +402,60 @@ class MindModel(nn.Module):
 
         return hidden_states, presents
 
+class MindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MindConfig
+
+    def __init__(self, config:MindConfig):
+        self.config = config
+
+        super().__init__(config)
+
+        self.model = MindModel(config)
+
+        self.lm_head = nn.Linear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+        )
+
+        # 权重共享
+        # 输出层的权重和嵌入层的权重共享
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+        self.OUT = CausalLMOutputWithPast()
+
+    def forward(
+            self,
+            input_ids:Optional[torch.Tensor]=None,
+            attention_mask:Optional[torch.Tensor]=None,
+            past_key_values:Optional[Tuple[Tuple[torch.Tensor, torch.Tensor]]]=None,
+            use_cache:bool=False,
+            logits_to_keep:Union[int, torch.Tensor]=0,
+            **kwargs,
+    ):
+        hidden_states, past_key_values = self.model(
+            input_ids,
+            attention_mask,
+            past_key_values,
+            use_cache,
+            **kwargs,
+        )
+        # logits_to_keep是整数，那就保留最后n个位置
+        # 生成的时候只需要最后的n个位置的logits来预测下个token
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
+
+        logits = self.lm_head(hidden_states[..., slice_indices, :])
+
+        self.OUT.__setitem__("last_hidden_state", hidden_states)
+        self.OUT.__setitem__("logits", logits)
+        self.OUT.__setitem__("past_key_values", past_key_values)
+
+        return self.OUT
+
 
 
 
