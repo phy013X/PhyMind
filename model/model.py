@@ -2,6 +2,7 @@
 # @Time : 2026/3/10 17:00
 # @Author : phy013x
 # @File : model.py
+import math
 
 from transformers import PretrainedConfig
 
@@ -77,6 +78,11 @@ class MindConfig(PretrainedConfig):
 
 import torch
 import torch.nn as nn
+from typing import Optional, Tuple, List, Union
+import torch.nn.functional as F
+from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin, PreTrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 # 继承nn.Module
 class RMSNorm(nn.Module):
@@ -94,5 +100,76 @@ class RMSNorm(nn.Module):
     # forward
     def forward(self, x):
         return self._norm(x.float()).type_as(x) * self.weight * x
+
+def precompute_freqs_cis(dim:int, end:int(32*1024), rope_base, rope_scaling:Optional[dict]=None)
+    # 初始化频率和温度系数
+    freqs, attn_factor = (1.0/(rope_base ** (torch.arange(0, dim, 2)[:dim//2].float()/dim)), 1.0)
+
+    if rope_scaling is not None:
+        orig_max, factor, beta_fast, beta_slow = (rope_scaling["original_max_position_embeddings"],
+                                                  rope_scaling["factor"],
+                                                  rope_scaling["beta_fast"],
+                                                  rope_scaling["beta_slow"])
+        # 推断的长度大于训练长度，进行缩放
+        if end > orig_max:
+            # 波长λ向维度i的映射 b = orig_max / λ，b的实际含义是频率组
+            inv_dim = lambda b : (dim * math.log(orig_max / (2 * math.pi * b))/(2 * math.log(rope_base)))
+            # 划分高低维度
+            # low：不需要缩放的高频低维度部分
+            # high：需要缩放的低频高维度部分
+            low, high = (max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1))
+
+            # 计算缩放因子
+            # low之前，ramp为0, 在high之后，ramp为1，在low和high之间，ramp逐渐过度
+            ramp = torch.clamp(
+                (torch.arange(dim // 2, device=freqs.device).float() - low)
+                / max(high - low, 0.001),
+                0,
+                1
+            )
+            # 当ramp = 0时（高频）：系数为1，保持原频率不变
+            # 当ramp = 1时（低频）：系数为1 / factor，即对频率进行线性插值缩放
+            # 当ramp在0-1之间时：平滑过度
+            freqs = freqs * (1 - ramp + ramp / factor)
+
+            # 根据end，生成位置索引t
+            t = torch.arange(end, device=freqs.device).float()
+
+            # 计算外积， 将t和频率部分相乘，得到每一个位置的旋转角度
+            freqs = torch.outer(t, freqs).float()
+            fres_cos = (
+                torch.cat([torch.cos(freqs), torch.cos(freqs)], dim =1) * attn_factor
+            )
+            fres_sin = (
+                torch.cat([torch.sin(freqs), torch.sin(freqs)], dim =1) * attn_factor
+            )
+
+            return fres_cos, fres_sin
+
+# 编写RoPE的代码
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsequeeze_dim=1):
+    # [a, b] -> [-b, a]
+    def rotate_half(x):
+        # x.shape[-1]取最后一个维度
+        # x[..., x.shape[-1] // 2 :]取出x的后半部分
+         return torch.cat(
+            (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
+        )
+    # x_rotated = x*cos +rotate_half(x)*sin
+    q_embed = (q * cos.unsqueeze(unsequeeze_dim) + rotate_half(q) * sin.unsqueeze(unsequeeze_dim))
+    k_embed = (k * cos.unsqueeze(unsequeeze_dim) + rotate_half(k) * sin.unsqueeze(unsequeeze_dim))
+
+    return q_embed, k_embed
+
+
+
+
+
+
+
+
+
+
+
 
 
