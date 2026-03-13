@@ -3,7 +3,6 @@
 # @Author : phy013x
 # @File : model.py
 import math
-
 from transformers import PretrainedConfig
 
 class MindConfig(PretrainedConfig):
@@ -95,11 +94,11 @@ class RMSNorm(nn.Module):
 
     # _norm
     def _norm(self, x):
-        return torch.rsqrt(x.pow(2).sum().mean(dim=-1, keepdim=True) + self.eps)
+        return torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
     # forward
     def forward(self, x):
-        return self._norm(x.float()).type_as(x) * self.weight * x
+        return x * self._norm(x.float()).type_as(x) * self.weight
 
 def precompute_freqs_cis(dim:int, rope_base, end:int=32*1024,rope_scaling:Optional[dict]=None):
     # 初始化频率和温度系数
@@ -132,19 +131,19 @@ def precompute_freqs_cis(dim:int, rope_base, end:int=32*1024,rope_scaling:Option
             # 当ramp在0-1之间时：平滑过度
             freqs = freqs * (1 - ramp + ramp / factor)
 
-            # 根据end，生成位置索引t
-            t = torch.arange(end, device=freqs.device).float()
+    # 根据end，生成位置索引t
+    t = torch.arange(end, device=freqs.device).float()
 
-            # 计算外积， 将t和频率部分相乘，得到每一个位置的旋转角度
-            freqs = torch.outer(t, freqs).float()
-            fres_cos = (
-                torch.cat([torch.cos(freqs), torch.cos(freqs)], dim =1) * attn_factor
-            )
-            fres_sin = (
-                torch.cat([torch.sin(freqs), torch.sin(freqs)], dim =1) * attn_factor
-            )
+    # 计算外积， 将t和频率部分相乘，得到每一个位置的旋转角度
+    freqs = torch.outer(t, freqs).float()
+    freqs_cos = (
+        torch.cat([torch.cos(freqs), torch.cos(freqs)], dim =1) * attn_factor
+    )
+    freqs_sin = (
+        torch.cat([torch.sin(freqs), torch.sin(freqs)], dim =1) * attn_factor
+    )
 
-            return fres_cos, fres_sin
+    return freqs_cos, freqs_sin
 
 # 编写RoPE的代码
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -180,7 +179,7 @@ class Attention(nn.Module):
         self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads is not None else args.num_attention_heads
 
         assert args.num_attention_heads % self.num_key_value_heads == 0, \
-        "The number of key-value heads needs to be a multiple of the number of attention heads."
+        "The number of attention heads needs to be a multiple of the number of key-value heads."
 
         self.n_local_heads = args.num_attention_heads
         self.num_key_value_heads = args.num_key_value_heads
@@ -204,18 +203,18 @@ class Attention(nn.Module):
             position_embedding: Tuple[torch.Tensor, torch.Tensor],
             past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]]=None,
             use_cache=False,
-            attention_mask: Optional[Tuple[torch.Tensor, torch.Tensor]]=None
-    )->torch.Tensor:
+            attention_mask: Optional[torch.Tensor]=None
+    )->Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # 投影，计算q, k, v
         # [bsz, slen, hidden_size]
-        bsz, seq_len = x.shape
+        bsz, seq_len, _ = x.shape
         q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
         # 把输入拆分为多个头，用view
         q = q.view(bsz, seq_len, self.n_local_heads, self.head_dim).transpose(1, 2).contiguous()
         k = k.view(bsz, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2).contiguous()
         v = v.view(bsz, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2).contiguous()
-        # [bsz, n_k_v_heads, slen, head_dim]
+        # [bsz, n_heads, slen, head_dim]
 
         # q和k，使用RoPE
         cos, sin = position_embedding
@@ -223,12 +222,16 @@ class Attention(nn.Module):
 
         # k和v，使用repeat（注意kv cache）
         if past_key_value is not None:
-            k = torch.cat((past_key_value[0], k), dim=1)
-            v = torch.cat((past_key_value[1], v), dim=1)
+            k = torch.cat((past_key_value[0], k), dim=2)
+            v = torch.cat((past_key_value[1], v), dim=2)
         past_key_value = (k, v)
 
+        # 对k和v进行repeat，实现GQA
+        k = repeat_kv(k, self.n_rep)
+        v = repeat_kv(v, self.n_rep)
+
         q, k, v = (
-            # [bsz, n_local_heads, slen, head_dim]
+            # [bsz, slen, n_local_heads, head_dim]
             q.transpose(1, 2),
             k.transpose(1, 2),
             v.transpose(1, 2),
@@ -250,22 +253,22 @@ class Attention(nn.Module):
                 is_causal=True
             )
         else:
-            scores = (q@k.transpose(-2, 1) / math.sqrt(self.head_dim))
+            scores = (q@k.transpose(-2, -1) / math.sqrt(self.head_dim))
             scores = scores + torch.triu(
-                torch.full((seq_len, seq_len), float("inf"), device=scores.device),
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
                 diagonal=1
             ).unsqueeze(0).unsqueeze(0)
 
             # 最后拼接头，输出投影，返回
             if attention_mask is not None:
-                extented_attention_mask = attention_mask.unsquzeeze(1).unsqueeze(2)
+                extented_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                 extented_attention_mask = (1.0 - extented_attention_mask) * -1e9
                 scores = scores + extented_attention_mask
 
-        scores = F.softmax(scores.float(), dim=-1).type_as(q)
-        scores = self.attn_dropout(scores)
+            scores = F.softmax(scores.float(), dim=-1).type_as(q)
+            scores = self.attn_dropout(scores)
 
-        output = scores@v
+            output = scores@v
         # [bsz, n_local_heads, slen, head_dim]
         output = output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
@@ -295,7 +298,7 @@ class FeedForward(nn.Module):
         self.dropout = nn.Dropout(args.dropout)
 
     def forward(self, x):
-        return self.dropout(self.down_proj(self.act_fn(self.up_proj(x))) * self.gate_proj(x))
+        return self.dropout(self.down_proj(self.act_fn(self.up_proj(x)) * self.gate_proj(x)))
 
 class MindBlock(nn.Module):
     def __init__(self, layer_id:int, config:MindConfig):
@@ -316,7 +319,7 @@ class MindBlock(nn.Module):
             position_embedding: Tuple[torch.Tensor, torch.Tensor],
             past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]]=None,
             use_cache=False,
-            attention_mask: Optional[Tuple[torch.Tensor, torch.Tensor]]=None
+            attention_mask: Optional[torch.Tensor]=None
     )->torch.Tensor:
         residual = hidden_states
         hidden_states, present_key_value = self.attention(
@@ -350,8 +353,9 @@ class MindModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # RoPE预计算
+        head_dim = config.hidden_size // config.num_attention_heads
         freqs_cos, freqs_sin = precompute_freqs_cis(
-            dim=config.hidden_size,
+            dim=head_dim,
             end=config.max_position_embeddings,
             rope_base=config.rope_theta,
             rope_scaling=config.rope_scaling
@@ -406,10 +410,8 @@ class MindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MindConfig
 
     def __init__(self, config:MindConfig):
-        self.config = config
-
         super().__init__(config)
-
+        self.config = config
         self.model = MindModel(config)
 
         self.lm_head = nn.Linear(
@@ -422,7 +424,6 @@ class MindForCausalLM(PreTrainedModel, GenerationMixin):
         # 输出层的权重和嵌入层的权重共享
         self.model.embed_tokens.weight = self.lm_head.weight
 
-        self.OUT = CausalLMOutputWithPast()
 
     def forward(
             self,
@@ -450,20 +451,11 @@ class MindForCausalLM(PreTrainedModel, GenerationMixin):
 
         logits = self.lm_head(hidden_states[..., slice_indices, :])
 
-        self.OUT.__setitem__("last_hidden_state", hidden_states)
-        self.OUT.__setitem__("logits", logits)
-        self.OUT.__setitem__("past_key_values", past_key_values)
-
-        return self.OUT
-
-
-
-
-
-
-
-
-
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
 
 
 
