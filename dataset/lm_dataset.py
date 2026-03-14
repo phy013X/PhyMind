@@ -22,8 +22,19 @@ class PretrainDataset(Dataset):
         # 输入给GPU的最大长度
         self.max_length = max_length
 
-        # 使用HuggingFace datasets的惰性加载，避免一次性读入大文件
-        self.dataset = load_dataset("json", data_files=data_path, split="train")
+        # 检查data_path是否为列表
+        if isinstance(data_path, list):
+            # 加载多个数据集并合并
+            datasets = []
+            for path in data_path:
+                ds = load_dataset("json", data_files=path, split="train")
+                datasets.append(ds)
+            # 合并数据集
+            from datasets import concatenate_datasets
+            self.dataset = concatenate_datasets(datasets)
+        else:
+            # 使用HuggingFace datasets的惰性加载，避免一次性读入大文件
+            self.dataset = load_dataset("json", data_files=data_path, split="train")
 
     # __len__
     def __len__(self):

@@ -134,7 +134,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, args, lm_config,
                 epoch=epoch,
                 step=step,
                 wandb=wandb,
-                save_dir="../checkpoints",  # ！修正：原"checkpoints"缺少../前缀
+                save_dir="../checkpoints",
             )
 
             model.train()  # 恢复训练模式
@@ -146,12 +146,12 @@ if __name__ == "__main__":
     # ========== 基础训练参数 ==========
     parser.add_argument(
         "--save_dir", type=str, default="../out", help="模型保存目录"
-    )  # ！修正：原"out"缺少../前缀
+    )
     parser.add_argument(
         "--save_weight", default="pretrain", type=str, help="保存权重的前缀名"
     )
     parser.add_argument(
-        "--epochs", type=int, default=1, help="训练轮数（建议1轮zero或2-6轮充分训练）"
+        "--epochs", type=int, default=2, help="训练轮数（建议1轮zero或2-6轮充分训练）"
     )
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
@@ -192,8 +192,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_path",
         type=str,
-        default="../dataset/pretrain_hq.jsonl",  # ！修正：原"dataset/..."缺少../前缀
-        help="预训练数据路径",
+        nargs="+",
+        default=["../dataset/pretrain_hq.jsonl", "../dataset/sft_mini_512.jsonl"],
+        help="预训练数据路径，可以指定多个路径",
     )
     parser.add_argument(
         "--from_weight",
@@ -255,7 +256,7 @@ if __name__ == "__main__":
     ckp_data = (
         lm_checkpoint(
             lm_config, weight=args.save_weight, save_dir="../checkpoints"
-        )  # ！修正：原"checkpoints"缺少../前缀
+        )
         if args.from_resume == 1
         else None
     )
@@ -311,7 +312,13 @@ if __name__ == "__main__":
     # 初始化模型和分词器
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
 
+    # 打印模型结构
+    print(model)
+
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+
+    # 打印数据大小
+    Logger(f"训练数据大小: {len(train_ds)}")
 
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
 

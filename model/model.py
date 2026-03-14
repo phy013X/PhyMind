@@ -146,7 +146,7 @@ def precompute_freqs_cis(dim:int, rope_base, end:int=32*1024,rope_scaling:Option
     return freqs_cos, freqs_sin
 
 # 编写RoPE的代码
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=0):
     # [a, b] -> [-b, a]
     def rotate_half(x):
         # x.shape[-1]取最后一个维度
@@ -227,18 +227,25 @@ class Attention(nn.Module):
         past_key_value = (k, v)
 
         # 对k和v进行repeat，实现GQA
+        # 先转换形状为 [bsz, slen, num_key_value_heads, head_dim]
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
         k = repeat_kv(k, self.n_rep)
         v = repeat_kv(v, self.n_rep)
-
-        q, k, v = (
-            # [bsz, slen, n_local_heads, head_dim]
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-        )
+        
+        # 转换回 [bsz, n_local_heads, slen, head_dim] 形状
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # q的形状已经是 [bsz, n_local_heads, slen, head_dim]，不需要转换
 
         # 进行attention计算，q@k.T/sqrt(d)
         if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
+            # 对于 flash attention，需要将形状转换为 [bsz, slen, n_local_heads, head_dim]
+            q_flash = q.transpose(1, 2)
+            k_flash = k.transpose(1, 2)
+            v_flash = v.transpose(1, 2)
+            
             attn_mask = (
                 None
                 if attention_mask is None
@@ -247,11 +254,13 @@ class Attention(nn.Module):
                 .bool()
             )
             output = F.scaled_dot_product_attention(
-                q, k, v,
+                q_flash, k_flash, v_flash,
                 attn_mask=attn_mask,
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=True
             )
+            # 转换回 [bsz, n_local_heads, slen, head_dim] 形状
+            output = output.transpose(1, 2)
         else:
             scores = (q@k.transpose(-2, -1) / math.sqrt(self.head_dim))
             scores = scores + torch.triu(
@@ -261,7 +270,8 @@ class Attention(nn.Module):
 
             # 最后拼接头，输出投影，返回
             if attention_mask is not None:
-                extented_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                # 对于非flash attention，attention_mask的形状应该是 [bsz, 1, 1, slen]
+                extented_attention_mask = attention_mask.view(bsz, 1, 1, -1)
                 extented_attention_mask = (1.0 - extented_attention_mask) * -1e9
                 scores = scores + extented_attention_mask
 
@@ -292,7 +302,7 @@ class FeedForward(nn.Module):
         self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
 
         # 激活函数
-        self.act_fn = ACT2FN(args.hidden_act)
+        self.act_fn = ACT2FN[args.hidden_act]
 
         # dropout
         self.dropout = nn.Dropout(args.dropout)
