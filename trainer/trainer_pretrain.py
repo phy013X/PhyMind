@@ -204,7 +204,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--from_resume",
-        default=0,
+        default=1,
         type=int,
         choices=[0, 1],
         help="是否自动检测&续训（0=否，1=是）",
@@ -253,6 +253,7 @@ if __name__ == "__main__":
 
     # 📚 断点续训知识点
     # 如果开启了断点续训，尝试加载之前的训练状态
+    Logger(f"[断点续训] from_resume={args.from_resume}, save_weight={args.save_weight}")
     ckp_data = (
         lm_checkpoint(
             lm_config, weight=args.save_weight, save_dir="../checkpoints"
@@ -260,6 +261,10 @@ if __name__ == "__main__":
         if args.from_resume == 1
         else None
     )
+    if ckp_data:
+        Logger(f"[断点续训] ✅ 成功加载检查点！epoch={ckp_data['epoch']}, step={ckp_data.get('step', 0)}")
+    else:
+        Logger(f"[断点续训] ❌ 未找到检查点，将从头开始训练")
 
     # ========== 3. 设置混合精度 ==========
     """
@@ -328,15 +333,22 @@ if __name__ == "__main__":
 
     start_epoch, start_step = 0, 0
     if ckp_data:
+        Logger(f"[断点续训] 正在恢复训练状态...")
         # 恢复模型参数
         model.load_state_dict(ckp_data["model"])
+        Logger(f"[断点续训] ✅ 模型参数已恢复")
         # 恢复优化器状态（动量、方差估计等）
         optimizer.load_state_dict(ckp_data["optimizer"])
+        Logger(f"[断点续训] ✅ 优化器状态已恢复")
         # 恢复梯度缩放器状态
         scaler.load_state_dict(ckp_data["scaler"])
+        Logger(f"[断点续训] ✅ 梯度缩放器状态已恢复")
         # 恢复训练进度
         start_epoch = ckp_data["epoch"]
         start_step = ckp_data.get("step", 0)
+        Logger(f"[断点续训] 将从 epoch={start_epoch}, step={start_step} 继续训练")
+    else:
+        Logger(f"[断点续训] 从头开始训练: epoch=0, step=0")
 
     if dist.is_initialized():
         # 📚 RoPE位置编码特殊处理
@@ -344,6 +356,7 @@ if __name__ == "__main__":
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
+    Logger(f"[断点续训] 开始训练循环: epoch范围 [{start_epoch}, {args.epochs})")
     for epoch in range(start_epoch, args.epochs):
         # 📚 分布式采样器epoch设置
         # 每个epoch设置不同的随机种子，确保数据顺序随机化
@@ -352,6 +365,7 @@ if __name__ == "__main__":
 
         # 📚 断点续训逻辑
         if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
+            Logger(f"[断点续训] Epoch {epoch + 1}: 检测到需要跳过前{start_step}个step")
             # 使用跳批采样器，跳过已训练的数据
             batch_sampler = SkipBatchSampler(
                 train_sampler or range(len(train_ds)), args.batch_size, start_step
@@ -367,6 +381,7 @@ if __name__ == "__main__":
             )
             train_epoch(epoch, loader, len(loader) + start_step, model, optimizer, scaler, args, lm_config, autocast_ctx, start_step, wandb)
         else:  # 默认从头开始
+            Logger(f"[断点续训] Epoch {epoch + 1}: 正常从头开始训练")
             loader = DataLoader(
                 train_ds,
                 batch_size=args.batch_size,
