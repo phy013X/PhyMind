@@ -159,6 +159,7 @@ def ppo_train_epoch(
 
     for step, batch in enumerate(loader, start=start_step + 1):
         prompts = batch["prompt"]
+
         # 编码输入
         enc = tokenizer(
             prompts,
